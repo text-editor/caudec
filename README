@@ -1,0 +1,107 @@
+caudec 1.7.5: multiprocess audio converter
+Copyright © 2012 - 2014 Guillaume Cocatre-Zilgien
+http://caudec.net/
+
+caudec is a command-line utility that transcodes (converts) audio files from
+one format (codec) to another. It leverages multi-core CPUs with lots of RAM
+by using a ramdisk, and running multiple processes concurrently (one per file
+and per codec).
+
+* caudec is fast. Encoding Pink Floyd's The Wall (81 minutes, 26 tracks -
+  arguably classier than ABBA, but caudec doesn't discriminate) from WAV to FLAC
+  --best is done at 183x real time on a Core i7 @ 2.2 GHz with 8 processes,
+  versus 46x with one process. FLAC -5 encodes at 532x, TAK -p2 at 705x.
+* Supported input formats / codecs: WAV, AIFF, CAF, FLAC, WavPack,
+  Monkey's Audio, TAK, Apple Lossless (ALAC).
+* Supported output formats / codecs: WAV, AIFF, CAF, FLAC, Flake, WavPack,
+  Monkey's Audio, TAK, Apple Lossless (ALAC), lossyWAV, LAME, Ogg Vorbis,
+  Nero AAC, qaac, Musepack, Opus.
+* Support for high quality resampling and downmixing / upmixing to stereo,
+  with SoX.
+* Optimized I/O: input files are copied onto a ramdisk sequentially, so as
+  to get the best performance out of the underlying medium (e.g. a hard drive).
+  Transcoding however is done concurrently. Example: file 1 gets copied. When
+  that's done, transcoding of file 1 starts. Meanwhile, file 2 gets copied, etc…
+  Very little time is lost reading the files.
+* Transcoding to several different codecs at once is possible. In that case,
+  decoding of input files is done only once.
+* Multiple instances of caudec can be run concurrently while sharing ressources.
+* Metadata is preserved (as much as possible) from one codec to another.
+* Multiprocess Replaygain scanner (except for Opus and Musepack)
+* Uses existing, popular command line encoders/decoders.
+
+caudec is most useful when dealing with one album at a time (with 1, 2 or 3
+discs, with each track as a separate file). Handling of multiple albums is done
+via scripting (see http://caudec.net/documentation/examples/).
+caudec cannot efficiently deal with very large files (recordings that are
+several hours long), or very large numbers of files (messy collections with
+a single directory and thousands of files). Those are known limitations, and
+they are not within the scope of this program.
+
+Tested under Arch Linux and OS Ⅹ Mountain Lion. Thanks to Tobias Link for
+kindly giving me remote shell access to his Macbook so I could port caudec
+to OS Ⅹ.
+
+Please submit bug reports here: http://caudec.net/redirect/bugs
+
+If you enjoy caudec and would like to make a donation, see:
+http://caudec.net/donate/
+
+caudec uses common UNIX tools (which, uname, grep, stat, sed/gsed, date/gdate,
+tr, cut, wc, df, mktemp, xargs, nohup), as well as the following software:
+
+Mandatory Software:
+--------------------------------------------------------------------------------
+* bc: http://www.gnu.org/software/bc/
+* SoX: http://sox.sourceforge.net/
+
+Optional Software:
+--------------------------------------------------------------------------------
+
+Native Codecs:
+* FLAC: http://flac.sourceforge.net/
+* Flake: http://flake-enc.sourceforge.net/
+* WavPack: http://www.wavpack.com/
+* Monkey's Audio: http://www.monkeysaudio.com/ and
+  http://etree.org/shnutils/shntool/support/formats/ape/unix/
+* ffmpeg (ALAC, AAC, Monkey's Audio): http://ffmpeg.org/
+* LAME: http://lame.sourceforge.net/
+* Ogg Vorbis: http://www.vorbis.com/
+* Nero AAC: http://www.nero.com/eng/technologies-aac-codec.html
+* Musepack: http://musepack.net/ and
+  http://wiki.hydrogenaudio.org/index.php?title=Musepack
+* Opus: http://www.opus-codec.org/
+
+Windows Codecs:
+* Wine (for Windows binaries): http://www.winehq.org/
+* TAK: http://wiki.hydrogenaudio.org/index.php?title=TAK
+* lossyWAV: http://wiki.hydrogenaudio.org/index.php?title=LossyWAV
+* LAME: http://www.rarewares.org/mp3-lame-bundle.php
+* Ogg Vorbis: http://www.rarewares.org/ogg-oggenc.php
+* qaac (iTunes AAC encoding): https://sites.google.com/site/qaacpage/
+
+Replaygain:
+* wavegain: http://freecode.com/projects/wavegain
+* vorbisgain: http://sjeng.org/vorbisgain.html
+* mp3gain: http://mp3gain.sourceforge.net/
+* aacgain: http://aacgain.altosdesign.com/
+
+Miscellaneous:
+* wget (for checking for new versions): http://www.gnu.org/software/wget/wget.html
+* APEv2 (for files with APEv2 metadata): http://caudec.net/
+* cksfv (for hashing CRC32): http://zakalwe.fi/~shd/foss/cksfv/
+* md5sum (Linux) or md5 (OS Ⅹ) for hashing MD5 sums
+* sha1sum, sha256sum, sha512sum (Linux) or shasum (OS Ⅹ) for hashing SHA sums
+* eyeD3 (for MP3 tagging): http://eyed3.nicfit.net/
+
+
+In order to install caudec, required and optional software on OS Ⅹ, use the
+Homebrew package management software: http://mxcl.github.io/homebrew/
+Note that the GNU version of sed (gsed) is required; gdate is optional.
+
+To install caudec when no package is available for your distribution, run:
+$ sudo ./install.sh [ --prefix=/some/custom/path ]
+That script will install caudec in /usr/local by default, or in the directory
+specified with --prefix. A default configuration file will be installed as
+/etc/caudecrc, or ~/.caudecrc. An additional 'decaude' link will be installed
+alongside caudec, which is equivalent to 'caudec -d' (for decoding).

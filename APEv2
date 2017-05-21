@@ -1,0 +1,1648 @@
+#!/bin/bash
+
+# Copyright © 2013 - 2014 Guillaume Cocatre-Zilgien <gcocatre@gmail.com>
+# http://caudec.net/
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# This program is provided without warranty of any kind, either expressed,
+# implied, or statutory. The entire risk as to the quality and performance
+# of this program is with You. Under no circumstances and under no legal
+# theory shall any Contributor, or anyone who distributes this program,
+# be liable to You for any damages of any character.
+#
+# Full APEv2 specification:
+# http://wiki.hydrogenaudio.org/index.php?title=APEv2_specification
+
+printUsage ()
+{
+	echo "${me} ${VERSION}: APEv2 tagger
+Copyright © 2013 - 2014 Guillaume Cocatre-Zilgien
+http://caudec.net/
+
+Usage: $me [ PARAMETERS ] FILE(S)
+List, set or remove tags in APEv2 files (.ape, .wv, .mpc, .tak…).
+Default action: list tags, with colored field names.
+
+
+Tagging Parameters:
+--------------------------------------------------------------------------------
+  -i        read and set tags from STDIN
+  -f FILE   copy APEv2 tags from FILE (must contain a valid APEv2 tag)
+  -t F=V    set tag item with field name F and value V
+  -r F      remove tag item with field name F
+  -R        remove all APEv2 data
+
+  -a F=P    set artwork tag item with field name F, with the contents of file P;
+            F must start with 'Cover Art', and P must be a valid path to the
+            file (normally, either .jpg, .png or .gif).
+
+  -b F=P    set binary tag item with field name F, with the contents of file P;
+            P must be a valid path to the file
+
+  -d F=P    dump value of tag item with field name F into file P; P may be a
+            filename, or '-' to dump to STDOUT. This parameter may be used with
+            any type of field (artwork, binary or text), and can only be used
+            on its own. When dumping artwork, ${me} will automatically append
+            the correct file extension, if the provided filename (P) ends with
+            a dot ('.').
+
+
+Output Formatting Parameters:
+--------------------------------------------------------------------------------
+  -C        disable coloring
+
+  -D        print debugging information to STDERR
+
+  -z        machine-parsable output: replace new line chars with '\\n',
+            NULL chars with '\\x00', prefix read-only tag items with 'ro:', and
+            print artwork and binary data as Base64 (preceded by 'artwork:' and
+            'data:', respectively). Implies -C.
+
+  -Z        raw mode: output new line chars, NULL chars and binary data as is.
+            Implies -C. Warning: this might mess up your terminal, unless you
+            redirect the output to a program that can handle it, or to a file.
+
+
+Notes about output modes:
+--------------------------------------------------------------------------------
+By default, $me prints tags in a colored, human readable format, with new line
+characters printed as is, NULL characters replaced with ' / ', artwork
+designated as 'artwork: <SIZE>' (byte size of the artwork) and binary data
+designated as 'data: <SIZE>' (byte size of the data).
+
+To disable coloring, use -C. To change the color of field names,
+export APEV2FCC='xyy', where 'x' is either '1' (bold) or '0', and 'yy' is
+a number between 30 and 37 (see: man 4 console_codes). To change the color of
+values, export APEV2VCC='xyy' (default: '000', i.e. no coloring of values).
+If both environment variables are set to '000', coloring is disabled (like
+using -C). Note that coloring is always disabled when using -z or -Z.
+
+
+Notes about setting and removing tag items:
+--------------------------------------------------------------------------------
+To specify new lines with -t or -i, write them as '\\n' (though actual new lines
+are accepted as well); to specify NULL chars (for NULL separated lists of
+values), write them as '\\x00'. The -z parameter uses those notations.
+
+When feeding tags via STDIN (-i), you must specify one FIELD=VALUE pair on each
+line. Write new lines and NULL chars as '\\n' and '\\x00', respectively.
+To read FIELD=VALUE pairs from a text file, simply run:
+\$ ${me} -i file.ape < metadata.txt
+
+In order to mark a tag item read-only with -t, -i, -a or -b, precede the field
+name with 'ro:', e.g.: -t \"ro:Artist=Daft Punk\". Read-only items cannot be
+updated, but they may be explicitely removed with the -r parameter.
+
+Note that in the APEv2 specification, all field names are unique; using -i, -t,
+-a or -b will either create new tag items, or replace existing ones. You may
+also use the -r and -R parameters with -i, -t, -a and -b.
+
+
+Miscellaneous:
+--------------------------------------------------------------------------------
+The full APEv2 specification can be found on the Hydrogenaudio Wiki:
+http://wiki.hydrogenaudio.org/index.php?title=APEv2_specification"
+}
+
+cleanExit ()
+{
+	if [ -n "$nProcesses" ]; then
+		if [ $nProcesses -gt 1 ]; then
+			kill $( jobs -p ) >/dev/null 2>&1
+		fi
+	fi
+	if [ -n "$tempDir" -a -e "$tempDir" ]; then
+		rm -rf "$tempDir" >/dev/null 2>&1
+	fi
+	exit $1
+}
+
+cleanAbort ()
+{
+	if [ -n "$nProcesses" ]; then
+		if [ $nProcesses -gt 1 ]; then
+			kill $( jobs -p ) >/dev/null 2>&1
+		fi
+		unset nProcesses
+	fi
+	echo
+	cleanExit $EX_INTERRUPT
+}
+
+debugMsg ()
+{
+	if [ $debug = true ]; then
+		echo -e "${WG}DEBUG:${NM} $1" 1>&2
+	fi
+}
+
+printWarning ()
+{
+	if [ "$outputMode" = 'colors' ]; then
+		echo -e "${WG}Warning:${NM} $1" 1>&2
+	else
+		echo -E "Warning: $1" 1>&2
+	fi
+}
+
+printError ()
+{
+	if [ "$outputMode" = 'colors' ]; then
+		echo -e "${KO}Error:${NM} $1" 1>&2
+	else
+		echo -E "Error: $1" 1>&2
+	fi
+}
+
+setColors ()
+{
+	local boldCode='' colorCode=''
+
+	if [ "$outputMode" = 'colors' ]; then # default mode
+		if [ "$APEV2FCC" = '000' -a "$APEV2VCC" = '000' ]; then
+			outputMode='human' # disable all coloring
+		else
+			NM="\\033[0m" # reset
+			OK="\\033[1;32m" # success: bright green
+			KO="\\033[1;31m" # failure: bright red
+			WG="\\033[1;33m" # warning: bright orange
+			FC="\\033[1;34m" # field names: bright blue
+			VC="$NM" # item values: no coloring
+
+			# custom field name color
+			if [ "$APEV2FCC" = '000' ]; then
+				FC="$NM" # disable coloring of field names
+			elif [ "${#APEV2FCC}" -eq 3 ]; then
+				if [ "${APEV2FCC:0:1}" = '0' ]; then
+					boldCode='0'
+				else
+					boldCode='1'
+				fi
+				case "${APEV2FCC:1:2}" in
+					3[0-7]) colorCode="${APEV2FCC:1:2}" ;;
+					*) colorCode='34'
+				esac
+				FC="\\033[${boldCode};${colorCode}m"
+			fi
+
+			# custom item value color
+			if [ "$APEV2VCC" = '000' ]; then
+				VC="$NM" # disable coloring of item values
+			elif [ "${#APEV2VCC}" -eq 3 ]; then
+				if [ "${APEV2VCC:0:1}" = '0' ]; then
+					boldCode='0'
+				else
+					boldCode='1'
+				fi
+				colorCode="${APEV2VCC:1:2}"
+				case "$colorCode" in
+					3[0-7]) VC="\\033[${boldCode};${colorCode}m" ;;
+				esac
+			fi
+		fi
+	else # outputMode != 'colors'
+		# disable all colors
+		NM='' OK='' KO='' WG='' FC='' VC=''
+	fi
+}
+
+createTempDir ()
+{
+	if [ -n "$tempDir" -a -d "$tempDir" -a -w "$tempDir" ]; then
+		return $EX_OK
+	fi
+
+	tempDir=''
+	if [ -n "$TMPDIR" -a -d "$TMPDIR" -a -w "$TMPDIR" ]; then
+		tempDir="$( TMPDIR="$TMPDIR" mktemp -d "${TMPDIR}/${me}.XXXXXXXX" )"
+	elif [ -d '/tmp' -a -w '/tmp' ]; then
+		tempDir="$( TMPDIR='/tmp' mktemp -d "/tmp/${me}.XXXXXXXX" )"
+	elif [ -d '/dev/shm' -a -w '/dev/shm' ]; then
+		tempDir="$( TMPDIR='/dev/shm' mktemp -d "/dev/shm/${me}.XXXXXXXX" )"
+	elif [ -d "$PWD" -a -w "$PWD" ]; then
+		tempDir="$( TMPDIR="$PWD" mktemp -d "${PWD}/${me}.XXXXXXXX" )"
+	fi
+	if [ -z "$tempDir" -o ! -d "$tempDir" -o ! -w "$tempDir" ]; then
+		printError "can't create temporary directory."
+		if [ -n "$tempDir" -a -d "$tempDir" ]; then
+			rm -rf "$tempDir" >/dev/null 2>&1
+		fi
+		cleanExit $EX_IOERR
+	else
+		mkdir -p "${tempDir}/common" >/dev/null 2>&1
+		return $EX_OK
+	fi
+}
+
+createTempProcessDir ()
+{
+	tempProcessDir="${tempDir}/process.${pn}"
+	if [ -e "$tempProcessDir" ]; then
+		rm -rf "$tempProcessDir" >/dev/null 2>&1
+	fi
+	mkdir -p "$tempProcessDir"
+}
+
+checkBinary ()
+{
+	local p rc=$EX_OK
+
+	for b in "$@"; do
+		p="x${b}Y"
+		if [ "$searchedBinaries" = "${searchedBinaries//$p/@}" ]; then # search for binary hasn't been done before
+			searchedBinaries="${searchedBinaries}${p}"
+			if which "$b" >/dev/null 2>&1 ; then
+				foundBinaries="${foundBinaries}${p}"
+				continue
+			else
+				rc=$EX_KO binaryMissing=true
+				printWarning "binary \"${b}\" not found. Make sure it is in your \$PATH."
+			fi
+		elif [ -z "$foundBinaries" -o "$foundBinaries" = "${foundBinaries//$p/@}" ]; then # binary was previously searched, but not found
+			rc=$EX_KO
+		fi
+	done
+
+	return $rc
+}
+
+checkBinaries ()
+{
+	searchedBinaries=''
+	binaryMissing=false
+
+	if ! which 'which' >/dev/null 2>&1 ; then
+		printWarning "binary \"which\" not found. Make sure it is in your \$PATH."
+		cleanExit $EX_OSFILE
+	fi
+
+	checkBinary "$sedcmd" 'od' 'tr' 'cut' 'dd' 'mktemp' 'dirname' 'wc' 'sort' 'head' 'tail' 'base64' 'stat' 'kill'
+
+	if [ $binaryMissing = true ]; then
+		cleanExit $EX_OSFILE
+	else
+		return $EX_OK
+	fi
+}
+
+startTimer ()
+{
+	if [ $gnudate = true ]; then
+		timer1="$( $datecmd '+%s.%N' )"
+	else
+		timer1="$( date '+%s' ).0"
+	fi
+}
+
+stopTimer ()
+{
+	local seconds timer2
+
+	if [ $gnudate = true ]; then
+		timer2="$( $datecmd '+%s.%N' )"
+	else
+		timer2="$( date '+%s' ).0"
+	fi
+	seconds="$( printf 'scale=6; %.6f - %.6f\n' "$timer2" "$timer1" | bc 2>/dev/null )"
+	printf "${WG}%s:${NM} %.3f seconds\n" "$1" $seconds 1>&2
+}
+
+readBinaryDecimalInteger ()
+{
+	local start="$1" length="$2" i=0
+
+	i="$( od -A n -j $start -N $length -i "$file" 2>/dev/null | tr -cd '0-9' )"
+	case "$i" in
+		[0-9]*) echo "$i" ;;
+		*) echo '-1' ;;
+	esac
+}
+
+getHumanByteSize ()
+{
+	local bytes="$1"
+
+	if [ $bytes -lt 1024 ]; then
+		echo -n "$bytes B"
+	elif [ $bytes -lt 1048576 ]; then
+		printf "%.1f %s" "$( echo "scale=3; $bytes / 1024" | bc )" 'KiB'
+	elif [ $bytes -lt 1073741824 ]; then
+		printf "%.1f %s" "$( echo "scale=3; $bytes / 1048576" | bc )" 'MiB'
+	else # Houston, we have a problem.
+		printf "%.1f %s" "$( echo "scale=3; $bytes / 1073741824" | bc )" 'GiB'
+	fi
+}
+
+integerToBinaryData ()
+{
+	local h=''
+
+	h="$( printf "%08X" "$1" )"
+	echo -en "\x${h:6:2}\x${h:4:2}\x${h:2:2}\x${h:0:2}"
+}
+
+getFileSize ()
+{
+	local file="$1" bytes
+
+	if [ ! -e "$file" ]; then
+		printError "file \"${file}\" doesn't exist."
+		echo 0
+	else
+		if [ "$OS" = 'Linux' ]; then
+			bytes="$( stat -L -c %s "$file" 2>/dev/null | tr -cd '0-9' )"
+		else
+			bytes="$( stat -L -f %z "$file" 2>/dev/null | tr -cd '0-9' )"
+		fi
+		case "$bytes" in
+			[0-9]*) echo $bytes ;;
+			*) echo 0 ;;
+		esac
+	fi
+}
+
+getFilePortion ()
+{
+	local offset=$1 size=$2 tailSize=0
+
+	if [ "$apetagLocation" = 'bottom' ]; then
+		tailSize=$(( fileSize - offset ))
+		tail -c $tailSize "$file" 2>/dev/null | head -c $size 2>/dev/null
+	else
+		head -c $(( offset + size )) "$file" 2>/dev/null | tail -c $size 2>/dev/null
+	fi
+}
+
+hasApetag ()
+{
+	local preamble=''
+
+	if [ "$apetagPresent" = 'true' ]; then
+		return $EX_OK
+	elif [ "$apetagPresent" = 'false' ]; then
+		return $EX_KO
+	else
+		if [ $fileSize -le 64 ]; then
+			debugMsg 'no apetag present'
+			return $EX_KO
+		fi
+
+		# check the end of the file first
+		preamble="$( dd if="$file" bs=1 skip=$(( fileSize - 32 )) count=8 2>/dev/null | LC_ALL=C tr -cd 'A-Z' )"
+		if [ "$preamble" = 'APETAGEX' ]; then
+			apetagVersion="$( readBinaryDecimalInteger $(( fileSize - 32 + 8 )) 4 )"
+			apetagPresent='true' apetagLocation='bottom' hasFooter=true footerOffset=$(( fileSize - 32 ))
+			debugMsg "apetag present: location=${apetagLocation}, version=${apetagVersion}, footerOffset=${footerOffset}"
+		else
+			# check the beginning of the file
+			preamble="$( dd if="$file" bs=8 count=1 2>/dev/null | LC_ALL=C tr -cd 'A-Z' )"
+			if [ "$preamble" = 'APETAGEX' ]; then
+				apetagVersion="$( readBinaryDecimalInteger 8 4 )"
+				apetagPresent='true' apetagLocation='top' hasHeader=true headerOffset=0
+				debugMsg "apetag present: location=${apetagLocation}, version=${apetagVersion}, headerOffset=${headerOffset}"
+			fi
+		fi
+
+		if [ "$preamble" = 'APETAGEX' ]; then
+			if [ "$apetagVersion" = '2000' ]; then
+				apetagPresent='true'
+				return $EX_OK
+			elif [ "$apetagVersion" = '-1' ]; then
+				printError "file \"$file\" is corrupted: invalid APE version number."
+				return $EX_DATAERR
+			else
+				printWarning "unsupported APE version (${apetagVersion})"
+				apetagPresent='false'
+				return $EX_KO
+			fi
+		else
+			apetagPresent='false'
+			debugMsg 'no apetag present'
+			return $EX_KO
+		fi
+	fi
+}
+
+getApetagSize ()
+{
+	# tag size does NOT include the header, if present
+	if [ "$apetagLocation" = 'bottom' ]; then
+		tagSize="$( readBinaryDecimalInteger $(( footerOffset + 8 + 4 )) 4 )"
+		if [ "$tagSize" = '-1' ]; then
+			printError "file \"$file\" is corrupted: invalid tag size."
+			return $EX_DATAERR
+		elif [ $tagSize -lt 32 ]; then # smaller than the footer alone
+			printError "file \"$file\" is corrupted: tag size smaller than 32 bytes."
+			return $EX_DATAERR
+		fi
+	else
+		tagSize="$( readBinaryDecimalInteger $(( headerOffset + 8 + 4 )) 4 )"
+		if [ $tagSize -lt 0 ]; then # invalid value (minimum: 0, no tag items, no footer)
+			printError "file \"$file\" is corrupted: invalid tag size."
+			return $EX_DATAERR
+		fi
+	fi
+	debugMsg "tagSize=${tagSize}"
+}
+
+getApetagOffset ()
+{
+	local preamble=''
+
+	if [ "$apetagLocation" = 'bottom' ]; then
+		apetagOffset=$(( fileSize - tagSize ))
+		preamble="$( dd if="$file" bs=1 skip=$(( apetagOffset - 32 )) count=8 2>/dev/null | LC_ALL=C tr -cd 'A-Z' )"
+		if [ "$preamble" = 'APETAGEX' ]; then
+			hasHeader=true
+			apetagOffset=$(( apetagOffset - 32 ))
+			headerOffset=$apetagOffset
+			debugMsg "hasHeader=${hasHeader}, hasFooter=${hasFooter}, apetagOffset=${apetagOffset}, headerOffset=${headerOffset}"
+		else
+			debugMsg "hasHeader=${hasHeader}, hasFooter=${hasFooter}, apetagOffset=${apetagOffset}"
+		fi
+	else
+		apetagOffset=0
+		preamble="$( dd if="$file" bs=1 skip=$(( apetagOffset + 32 + tagSize - 32 )) count=8 2>/dev/null | LC_ALL=C tr -cd 'A-Z' )"
+		if [ "$preamble" = 'APETAGEX' ]; then
+			hasFooter=true
+			footerOffset=$(( apetagOffset + 32 + tagSize - 32 ))
+			debugMsg "hasHeader=${hasHeader}, hasFooter=${hasFooter}, apetagOffset=${apetagOffset}, footerOffset=${footerOffset}"
+		else
+			debugMsg "hasHeader=${hasHeader}, hasFooter=${hasFooter}, apetagOffset=${apetagOffset}"
+		fi
+	fi
+}
+
+resetApetagProperties ()
+{
+	apetagPresent='false'
+	fileSize=$apetagOffset
+	tagSize=0
+	apetagOffset=0
+	headerOffset=0
+	footerOffset=0
+	itemsOffset=0
+	apetagLocation='none'
+	hasHeader=false
+	hasFooter=false
+}
+
+initFileVars ()
+{
+	debugMsg '--------------------------------------------------------------------------------'
+	debugMsg "file: \"${file}\""
+	fileSize="$( getFileSize "$file" )"
+	debugMsg "fileSize=${fileSize}"
+	apetagPresent=''
+	tagSize=0
+	apetagOffset=0
+	headerOffset=0
+	footerOffset=0
+	itemsOffset=0
+	itemsCount=0
+	allKeys=''
+	readOnlyKeys=''
+	apetagLocation='none'
+	hasHeader=false
+	hasFooter=false
+	sortedItemSizes=''
+	unset itemKeys itemLowercaseKeys itemValues
+	declare -a itemKeys=()
+	declare -a itemLowercaseKeys=()
+	declare -a itemValues=()
+}
+
+removeApetag ()
+{
+	local ec=$EX_OK tempFile=''
+
+	if [ "$apetagLocation" = 'bottom' ]; then
+		if which 'truncate' >/dev/null 2>&1 ; then
+			truncate -s $apetagOffset "$file" 2>/dev/null ; ec=$?
+		elif which 'gtruncate' >/dev/null 2>&1 ; then
+			gtruncate -s $apetagOffset "$file" 2>/dev/null ; ec=$?
+		else
+			tempFile="${tempProcessDir}/tempfile"
+			head -c $apetagOffset "$file" 2>/dev/null | dd of="$tempFile" bs=$(( 8192 * 1024 )) >/dev/null 2>&1 ; ec=$?
+			if [ $ec -eq $EX_OK ]; then
+				rm -f "$file" >/dev/null 2>&1 &&
+				mv -f "$tempFile" "$file" >/dev/null 2>&1 ; ec=$?
+			fi
+			if [ -e "$tempFile" ]; then rm -f "$tempFile"; fi
+		fi
+		resetApetagProperties
+		return $ec
+	else # apetagLocation = 'top'
+		tempFile="${tempProcessDir}/tempfile"
+		tail -c $(( fileSize - (32 + tagSize) )) "$file" 2>/dev/null | dd of="$tempFile" bs=$(( 8192 * 1024 )) >/dev/null 2>&1 ; ec=$?
+		resetApetagProperties
+		if [ $ec -eq $EX_OK ]; then
+			rm -f "$file" >/dev/null 2>&1 &&
+			mv -f "$tempFile" "$file" >/dev/null 2>&1 ; ec=$?
+		fi
+		if [ -e "$tempFile" ]; then rm -f "$tempFile"; fi
+		return $ec
+	fi
+}
+
+writeNewApetag ()
+{
+	local itemKey itemValue itemValueSize itemSize itemValueTypes=() fileDir='' tempDirLength p artworkFilenameSize=0 artworkFilepath artworkFilename binaryFilepath
+
+	sortedItemSizes=''
+	fileDir="$( dirname "$file" )"
+	if [ "$fileDir" != '/' ]; then fileDir="${fileDir}/"; fi
+
+	tagSize=32
+	for ((i=0; i<itemsCount; i++)); do
+		itemKey="${itemKeys[$i]}"
+		itemValue="${itemValues[$i]}"
+		if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+			itemValueTypes[$i]='binary'
+			binaryFilepath="${itemValue##*:}"
+			itemSize="$( getFileSize "$binaryFilepath" )"
+			itemSize=$(( 4 + 4 + ${#itemKey} + 1 + itemSize ))
+			sortedItemSizes="${sortedItemSizes}$( echo -en "\n${itemSize} ${i}" )"
+		elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+			itemValueTypes[$i]='artwork'
+			artworkFilepath="${itemValue##*:}"
+			artworkFilename="${itemValue:16}"; artworkFilename="${artworkFilename%:*}"
+			itemSize="$( getFileSize "$artworkFilepath" )"
+			artworkFilenameSize="$( echo -En "$artworkFilename" | wc -c | tr -cd '0-9' )"
+			itemSize=$(( 4 + 4 + ${#itemKey} + 1 + artworkFilenameSize + 1 + itemSize ))
+			sortedItemSizes="${sortedItemSizes}$( echo -en "\n${itemSize} ${i}" )"
+		else
+			itemValue="${itemValues[$i]}"
+			# adding 'x...x' when testing $itemValue because a value of '(' would make the tests crap out with a BASH error: line 581: [: `)' expected, found (
+			if [ "x${itemValue:0:7}x" = 'xhttp://x' -o "x${itemValue:0:6}x" = 'xftp://x' -o "x${itemValue:1:2}x" = 'x:/x' ]; then
+				itemValueTypes[$i]='locator'
+			elif [ "x${itemValue%.*}x" != "x${itemValue}x" -a -n "${itemValue##*.}" -a "x${itemValue:0:1}x" != 'x/x' -a -f "${fileDir}${itemValue}" ]; then
+				itemValueTypes[$i]='locator'
+			elif [ "x${itemValue%.*}x" != "x${itemValue}x" -a -n "${itemValue##*.}" -a "x${itemValue:0:1}x" = 'x/x' -a -f "${itemValue}" ]; then
+				itemValueTypes[$i]='locator'
+			else
+				itemValueTypes[$i]='text'
+			fi
+			itemSize="$( echo -En "$itemValue" | wc -c | tr -cd '0-9' )"
+			itemSize=$(( 4 + 4 + ${#itemKey} + 1 + $itemSize ))
+			sortedItemSizes="${sortedItemSizes}$( echo -en "\n${itemSize} ${i}" )"
+		fi
+		tagSize=$(( tagSize + itemSize ))
+	done
+
+	sortedItemSizes="$( echo "${sortedItemSizes:1}" | sort -n )"
+
+	{
+		# Header
+		echo -n 'APETAGEX' # preamble
+		echo -en "\xD0\x07\x00\x00" # version 2.0
+		integerToBinaryData $tagSize
+		integerToBinaryData $itemsCount
+		echo -en "\x00\x00\x00\xA0" # this is the header
+		echo -en "\x00\x00\x00\x00\x00\x00\x00\x00" # reserved
+
+		# Items
+		while read itemSize i; do
+			itemKey="${itemKeys[$i]}"
+			itemValue="${itemValues[$i]}"
+			if [ "${itemValueTypes[$i]}" = 'binary' ]; then
+				binaryFilepath="${itemValue##*:}"
+				integerToBinaryData "$( getFileSize "$binaryFilepath" )" # item value size
+			elif [ "${itemValueTypes[$i]}" = 'artwork' ]; then
+				artworkFilepath="${itemValue##*:}"
+				artworkFilename="${itemValue:16}"; artworkFilename="${artworkFilename%:*}"
+				artworkFilenameSize="$( echo -En "$artworkFilename" | wc -c | tr -cd '0-9' )"
+				itemValueSize="$( getFileSize "$artworkFilepath" )" # item value size
+				itemValueSize=$(( artworkFilenameSize + 1 + itemValueSize ))
+				integerToBinaryData "$itemValueSize" # item value size
+			else
+				itemSize="$( echo -En "$itemValue" | wc -c | tr -cd '0-9' )"
+				integerToBinaryData $itemSize # item value size
+			fi
+
+			p="x$( echo -En "$itemKey" | tr '[:upper:]' '[:lower:]' )Y"
+			if [ "$readOnlyKeys" = "${readOnlyKeys//$p/@}" -a "$newReadOnlyKeys" = "${newReadOnlyKeys//$p/@}" ]; then
+				case "${itemValueTypes[$i]}" in
+					text) echo -en "\x00\x00\x00\x00" ;;
+					binary|artwork) echo -en "\x02\x00\x00\x00" ;;
+					locator) echo -en "\x04\x00\x00\x00" ;;
+				esac
+			else
+				case "${itemValueTypes[$i]}" in
+					text) echo -en "\x01\x00\x00\x00" ;;
+					binary|artwork) echo -en "\x03\x00\x00\x00" ;;
+					locator) echo -en "\x05\x00\x00\x00" ;;
+				esac
+			fi
+
+			echo -En "$itemKey"
+			echo -en "\x00"
+			if [ "${itemValueTypes[$i]}" = 'binary' ]; then
+				cat "$binaryFilepath" 2>/dev/null
+			elif [ "${itemValueTypes[$i]}" = 'artwork' ]; then
+				echo -En "$artworkFilename"
+				echo -en "\x00"
+				cat "$artworkFilepath" 2>/dev/null
+			else
+				echo -En "$itemValue" | LC_ALL=C tr '\1' '\0' 2>/dev/null
+			fi
+		done < <( echo "$sortedItemSizes" )
+
+		# Footer
+		echo -n 'APETAGEX' # preamble
+		echo -en "\xD0\x07\x00\x00" # version 2.0
+		integerToBinaryData $tagSize
+		integerToBinaryData $itemsCount
+		echo -en "\x00\x00\x00\x80" # this is the footer
+		echo -en "\x00\x00\x00\x00\x00\x00\x00\x00" # reserved
+	} >> "$file"
+
+	return $EX_OK
+}
+
+getItemsOffset ()
+{
+	if [ "$apetagLocation" = 'bottom' ]; then
+		if [ $hasHeader = true ]; then
+			itemsOffset=$(( apetagOffset + 32 ))
+		else
+			itemsOffset=$apetagOffset
+		fi
+	else
+		itemsOffset=$(( apetagOffset + 32 ))
+	fi
+	debugMsg "itemsOffset=${itemsOffset}"
+}
+
+getNumberOfItems ()
+{
+	if [ "$apetagLocation" = 'bottom' ]; then
+		itemsCount="$( readBinaryDecimalInteger $(( footerOffset + 8 + 4 + 4 )) 4 )"
+	else
+		itemsCount="$( readBinaryDecimalInteger $(( headerOffset + 8 + 4 + 4 )) 4 )"
+	fi
+
+	if [ $itemsCount -lt 0 ]; then
+		printError "file \"$file\" is corrupted: invalid number of items."
+		return $EX_DATAERR
+	fi
+
+	debugMsg "itemsCount=${itemsCount}"
+}
+
+getItem ()
+{
+	local itemValueSize=0 itemKeyOffset=0 char='' o=0 itemValueType='' itemSize itemIsBinary=false itemIsReadOnly=false p='' itemFilename='' itemDataSize=0
+
+	itemKey='' itemLowercaseKey='' itemValue=''
+
+	itemValueSize="$( readBinaryDecimalInteger $itemOffset 4 )"
+	if [ $itemValueSize -lt 1 ]; then
+		printError "file \"$file\" is corrupted: invalid length of item value."
+		return $EX_DATAERR
+	fi
+	itemValueType="$( readBinaryDecimalInteger $(( itemOffset + 4 )) 4)"
+	if [ $itemValueType -lt 0 -o $itemValueType -gt 5 ]; then
+		printError "file \"$file\" is corrupted: invalid item flags ($itemValueType)."
+		return $EX_DATAERR
+	fi
+
+	itemKeyOffset=$(( itemOffset + 4 + 4 ))
+	o=$itemKeyOffset
+
+	# here tr and cut fail on OS X if LC_ALL is not set to C
+	itemKey="$( dd if="$file" bs=1 skip=$o count=255 2>/dev/null | LC_ALL=C tr '\0\n' '\1\2' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 1 2>/dev/null )"
+	if [ ${#itemKey} -lt 2 ]; then
+		printError "file \"$file\" is invalid: length of field name (${#itemKey}) should range from 2 to 255 characters."
+		return $EX_DATAERR
+	elif [ ${#itemKey} -eq 255 ]; then
+		char="$( readBinaryDecimalInteger $(( o + 255 )) 1 )"
+		if [ $char -ne 0 ]; then # the mandatory null char that separates the key from the value isn't there
+			printError "file \"$file\" is corrupted: NULL char missing between field name and item value."
+			return $EX_DATAERR
+		fi
+	fi
+	itemLowercaseKey="$( echo -En "$itemKey" | tr '[:upper:]' '[:lower:]' )"
+	p="x${itemLowercaseKey}Y"
+	if [ "$allKeys" != "${allKeys//$p/@}" ]; then
+		printError "file \"$file\" is invalid: it contains two or more items with the same field name (they must be unique)."
+		return $EX_DATAERR
+	fi
+	o=$(( o + ${#itemKey} + 1 ))
+
+	case "$itemValueType" in
+		0|4) itemIsReadOnly=false itemIsBinary=false ;;
+		1|5) itemIsReadOnly=true  itemIsBinary=false ;;
+		2)   itemIsReadOnly=false itemIsBinary=true ;;
+		3)   itemIsReadOnly=true  itemIsBinary=true ;;
+	esac
+
+	if [ $itemIsReadOnly = true ]; then
+		readOnlyKeys="${readOnlyKeys}x${itemLowercaseKey}Y"
+	fi
+
+	if [ $itemIsBinary = true ]; then # binary data
+		if [ "${itemLowercaseKey:0:9}" = 'cover art' ]; then
+			itemFilename="$( dd if="$file" bs=1 skip=$o count=255 2>/dev/null | LC_ALL=C tr '\0\n' '\1\2' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 1 2>/dev/null )"
+			if [ ${#itemFilename} -lt 5 ]; then
+				printError "file \"$file\" is invalid: length of cover art filename (${#itemFilename}) should range from 5 to 255 characters."
+				return $EX_DATAERR
+			elif [ ${#itemFilename} -eq 255 ]; then
+				char="$( readBinaryDecimalInteger $(( o + 255 )) 1 )"
+				if [ $char -ne 0 ]; then # the mandatory null char that separates the filename from the data isn't there
+					printError "file \"$file\" is corrupted: NULL char missing between filename and artwork data."
+					return $EX_DATAERR
+				fi
+			fi
+			itemDataSize=$(( itemValueSize - ${#itemFilename} - 1 ))
+			if [ $itemDataSize -lt 4 -o $itemDataSize -gt 1073741824 ]; then
+				printError "file \"$file\" is corrupted: invalid size (${itemDataSize} B) of cover art."
+				return $EX_DATAERR
+			fi
+			getFilePortion $(( o + ${#itemFilename} + 1 )) $itemDataSize > "${tempProcessDir}/artwork.${i}"
+			itemValue="artworkfilepath:${itemFilename}:${tempProcessDir}/artwork.${i}"
+		else # binary data
+			if [ $itemValueSize -lt 1 -o $itemValueSize -gt 1073741824 ]; then
+				printError "file \"$file\" is corrupted: invalid size (${itemValueSize} B) of binary data."
+				return $EX_DATAERR
+			fi
+			getFilePortion $o $itemValueSize > "${tempProcessDir}/binary.${i}"
+			itemValue="binaryfilepath:${tempProcessDir}/binary.${i}"
+		fi
+	else
+		if [ $itemValueSize -lt 1 -o $itemValueSize -gt 1073741824 ]; then
+			printError "file \"$file\" is corrupted: invalid length (${itemValueSize}) of item value."
+			return $EX_DATAERR
+		fi
+		itemValue="$( dd if="$file" bs=1 skip=$o count=$itemValueSize 2>/dev/null | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C tr -d '\r' 2>/dev/null )"
+	fi
+	itemSize=$(( o + itemValueSize - itemOffset ))
+	debugMsg "itemNumber=$i, itemOffset=${itemOffset}, itemSize=${itemSize}, readOnly=${itemIsReadOnly}, isBinary=${itemIsBinary}, itemKey=\"${itemKey}\", itemKeySize=${#itemKey}, itemValueSize=${itemValueSize}"
+	itemOffset=$(( o + itemValueSize ))
+}
+
+getItems ()
+{
+	local ec=$EX_OK
+
+	itemOffset="$itemsOffset"
+	for ((i=0; i<itemsCount; i++)); do
+		getItem; ec=$?
+		if [ $ec -eq $EX_OK ]; then
+			itemKeys[$i]="$itemKey"
+			itemLowercaseKeys[$i]="$itemLowercaseKey"
+			itemValues[$i]="$itemValue"
+			allKeys="${allKeys}x${itemLowercaseKey}Y"
+		else
+			return $ec
+		fi
+	done
+	return $ec
+}
+
+removeItems ()
+{
+	local tempItemCount=0 deleteKeys='' p='' itemValue=''
+	declare -a tempItemKeys=()
+	declare -a tempItemLowercaseKeys=()
+	declare -a tempItemValues=()
+
+	for ((i=0; i<deletedKeysCount; i++)); do
+		p="x${deletedLowercaseKeys[$i]}Y"
+		readOnlyKeys="${readOnlyKeys//$p/}"
+		deleteKeys="${deleteKeys}${p}"
+	done
+
+	for ((i=0; i<newTagsCount; i++)); do
+		p="x${newLowercaseKeys[$i]}Y"
+		if [ "$readOnlyKeys" = "${readOnlyKeys//$p/@}" ]; then
+			deleteKeys="${deleteKeys}${p}"
+		else
+			printWarning "item \"${newKeys[$i]}\" is marked read-only."
+		fi
+	done
+
+	for ((i=0; i<itemsCount; i++)); do
+		p="x${itemLowercaseKeys[$i]}Y"
+		if [ "$deleteKeys" = "${deleteKeys//$p/@}" ]; then
+			tempItemKeys[$tempItemCount]="${itemKeys[$i]}"
+			tempItemLowercaseKeys[$tempItemCount]="${itemLowercaseKeys[$i]}"
+			tempItemValues[$tempItemCount]="${itemValues[$i]}"
+			if [ -f "${tempProcessDir}/artwork.${i}" ]; then
+				mv "${tempProcessDir}/artwork.${i}" "${tempProcessDir}/tempArtwork.${tempItemCount}" >/dev/null 2>&1
+			elif [ -f "${tempProcessDir}/binary.${i}" ]; then
+				mv "${tempProcessDir}/binary.${i}" "${tempProcessDir}/tempBinary.${tempItemCount}" >/dev/null 2>&1
+			fi
+			((tempItemCount++))
+		elif [ -f "${tempProcessDir}/artwork.${i}" ]; then
+			rm -f "${tempProcessDir}/artwork.${i}" >/dev/null 2>&1
+		elif [ -f "${tempProcessDir}/binary.${i}" ]; then
+			rm -f "${tempProcessDir}/binary.${i}" >/dev/null 2>&1
+		fi
+	done
+
+	unset itemKeys itemLowercaseKeys itemValues
+	itemsCount=$tempItemCount
+	for ((i=0; i<tempItemCount; i++)); do
+		itemKeys[$i]="${tempItemKeys[$i]}"
+		itemLowercaseKeys[$i]="${tempItemLowercaseKeys[$i]}"
+		itemValues[$i]="${tempItemValues[$i]}"
+		if [ -f "${tempProcessDir}/tempArtwork.${i}" ]; then
+			mv "${tempProcessDir}/tempArtwork.${i}" "${tempProcessDir}/artwork.${i}" >/dev/null 2>&1
+			itemValue="${tempItemValues[$i]}"
+			itemValues[$i]="${itemValue%:*}:${tempProcessDir}/artwork.${i}"
+		elif [ -f "${tempProcessDir}/tempBinary.${i}" ]; then
+			mv "${tempProcessDir}/tempBinary.${i}" "${tempProcessDir}/binary.${i}" >/dev/null 2>&1
+			itemValue="${tempItemValues[$i]}"
+			itemValues[$i]="${itemValue%:*}:${tempProcessDir}/binary.${i}"
+		fi
+	done
+	unset tempItemKeys tempItemLowercaseKeys tempItemValues
+}
+
+addNewItems ()
+{
+	local p=''
+
+	# itemsCount is either set by removeItems(), or equal to zero
+	for ((i=0; i<newTagsCount; i++)); do
+		p="x${newLowercaseKeys[$i]}Y"
+		if [ "$readOnlyKeys" = "${readOnlyKeys//$p/@}" ]; then
+			itemKeys[$itemsCount]="${newKeys[$i]}"
+			itemLowercaseKeys[$itemsCount]="${newLowercaseKeys[$i]}"
+			itemValues[$itemsCount]="${newValues[$i]}"
+			((itemsCount++))
+		fi
+	done
+}
+
+listItems ()
+{
+	local itemKey='' itemLowercaseKey='' itemValue='' itemValueSize=0 roPrefix='' artworkFilename='' p='' ppn=0
+
+	if [ -z "$sortedItemSizes" ]; then
+		for ((i=0; i<itemsCount; i++)); do
+			sortedItemSizes="${sortedItemSizes}$( echo -en "\n0 ${i}" )"
+		done
+		sortedItemSizes="${sortedItemSizes:1}"
+	fi
+
+	case "$outputMode" in
+		colors)
+			{
+				while read foo i; do
+					itemKey="${itemKeys[$i]}"
+					itemValue="${itemValues[$i]}"
+					echo -en "${FC}"
+					echo -En "$itemKey"
+					echo -en "${NM}=${VC}"
+					if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+						itemValueSize="$( getFileSize "${itemValue:15}" )"
+						echo -En "data: $( getHumanByteSize "${itemValueSize}" )"
+					elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+						itemValueSize="$( getFileSize "${itemValue##*:}" )"
+						echo -En "artwork: $( getHumanByteSize "${itemValueSize}" )"
+					else
+						echo -En "${itemValue}"
+					fi
+					echo -e "${NM}"
+				done < <( echo "$sortedItemSizes" )
+			} | $sedcmd -e 's@\x01@ / @g' > "${tempDir}/common/outputQueue.${pn}"
+			;;
+
+		human)
+			{
+				while read foo i; do
+					itemKey="${itemKeys[$i]}"
+					itemValue="${itemValues[$i]}"
+					if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+						itemValueSize="$( getFileSize "${itemValue:15}" )"
+						echo -E "${itemKey}=data: $( getHumanByteSize "${itemValueSize}" )"
+					elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+						itemValueSize="$( getFileSize "${itemValue##*:}" )"
+						echo -E "${itemKey}=artwork: $( getHumanByteSize "${itemValueSize}" )"
+					else
+						echo -E "${itemKey}=${itemValue}"
+					fi
+				done < <( echo "$sortedItemSizes" )
+			} | $sedcmd -e 's@\x01@ / @g' > "${tempDir}/common/outputQueue.${pn}"
+			;;
+
+		machine)
+			{
+				while read foo i; do
+					itemKey="${itemKeys[$i]}"
+					itemLowercaseKey="${itemLowercaseKeys[$i]}"
+					itemValue="${itemValues[$i]}"
+					p="x${itemLowercaseKey}Y"
+					if [ "$readOnlyKeys" != "${readOnlyKeys//$p/@}" -o "$newReadOnlyKeys" != "${newReadOnlyKeys//$p/@}" ]; then
+						roPrefix='ro:'
+					else
+						roPrefix=''
+					fi
+					if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+						echo -En "${roPrefix}${itemKey}=data:"
+						if [ "$OS" = 'Linux' ]; then
+							base64 -w 0 "${itemValue:15}"
+							echo
+						else
+							# base64 on OS X outputs a trailing new line already
+							base64 -b 0 "${itemValue:15}"
+						fi
+					elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+						artworkFilename="${itemValue:16}"; artworkFilename="${artworkFilename%:*}"
+						echo -En "${roPrefix}${itemKey}=artwork:${artworkFilename}\x00"
+						if [ "$OS" = 'Linux' ]; then
+							base64 -w 0 "${itemValue##*:}"
+							echo
+						else
+							# base64 on OS X outputs a trailing new line already
+							base64 -b 0 "${itemValue##*:}"
+						fi
+					else
+						echo -En "${roPrefix}${itemKey}="
+						echo -En "${itemValues[$i]}" | LC_ALL=C tr '\n' '\2' 2>/dev/null
+						echo
+					fi
+				done < <( echo "$sortedItemSizes" )
+			} | $sedcmd -e 's@\x01@\\x00@g' -e 's@\x02@\\n@g' > "${tempDir}/common/outputQueue.${pn}"
+			;;
+
+		raw)
+			{
+				while read foo i; do
+					itemKey="${itemKeys[$i]}"
+					itemValue="${itemValues[$i]}"
+					if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+						echo -En "${itemKeys[$i]}="
+						cat "${itemValue:15}"
+					elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+						artworkFilename="${itemValue:16}"; artworkFilename="${artworkFilename%:*}"
+						echo -En "${itemKeys[$i]}=${artworkFilename}"
+						echo -en "\x00"
+						cat "${itemValue##*:}"
+					else
+						echo -E "${itemKeys[$i]}=${itemValue}"
+					fi
+				done < <( echo "$sortedItemSizes" )
+			} | LC_ALL=C tr '\1' '\0' 2>/dev/null > "${tempDir}/common/outputQueue.${pn}"
+			;;
+	esac
+}
+
+flushOutputQueue ()
+{
+	local oq=0
+
+	for ((oq=0; oq<nProcesses; oq++)); do
+		if [ -f "${tempDir}/common/outputQueue.${oq}" ]; then
+			if [ "$outputMode" = 'colors' ]; then
+				echo -e "$( cat "${tempDir}/common/outputQueue.${oq}" )"
+			else
+				cat "${tempDir}/common/outputQueue.${oq}"
+			fi
+			rm -f "${tempDir}/common/outputQueue.${oq}"
+		fi
+	done
+}
+
+dumpItems ()
+{
+	local itemValue='' itemValueSize=0 dumpFilePath='' someFieldNotFound=false artworkFilename='' artworkFileExtension=''
+
+	for (( k=0; k<dumpKeysCount; k++ )); do
+		for ((i=0; i<itemsCount; i++)); do
+			if [ "${itemLowercaseKeys[$i]}" = "${dumpKeys[$k]}" ]; then
+				itemValue="${itemValues[$i]}"
+				if [ "${itemValue:0:15}" = 'binaryfilepath:' ]; then
+					if [ "${dumpFiles[$k]}" = '-' ]; then
+						cat "${itemValue:15}" 2>/dev/null
+					else
+						cp "${itemValue:15}" "${dumpFiles[$k]}" >/dev/null 2>&1
+					fi
+				elif [ "${itemValue:0:16}" = 'artworkfilepath:' ]; then
+					if [ "${dumpFiles[$k]}" = '-' ]; then
+						cat "${itemValue##*:}" 2>/dev/null
+					else
+						case "${dumpFiles[$k]}" in
+							*.)
+								artworkFilename="${itemValue:16}"; artworkFilename="${artworkFilename%:*}"
+								case "$artworkFilename" in
+									*.png|*.PNG) artworkFilename="${dumpFiles[$k]}png" ;;
+									*.gif|*.GIF) artworkFilename="${dumpFiles[$k]}gif" ;;
+									*) artworkFilename="${dumpFiles[$k]}jpg" ;;
+								esac
+								;;
+							*) artworkFilename="${dumpFiles[$k]}" ;;
+						esac
+						cp "${itemValue##*:}" "$artworkFilename" >/dev/null 2>&1
+					fi
+				else
+					if [ "${dumpFiles[$k]}" = '-' ]; then
+						echo -En "$itemValue" | LC_ALL=C tr '\1' '\0' 2>/dev/null
+					else
+						echo -En "$itemValue" | LC_ALL=C tr '\1' '\0' > "${dumpFiles[$k]}" 2>/dev/null
+					fi
+				fi
+				continue 2
+			fi
+		done
+		printWarning "file \"${file}\" doesn't have a field named \"${dumpKeys[$k]}\"."
+		someFieldNotFound=true
+	done
+
+	if [ $someFieldNotFound = true ]; then
+		return $EX_KO
+	fi
+}
+
+checkInputFieldValueFormat ()
+{
+	local string="$1"
+
+	if [ "$string" = "${string//=/@}" ]; then
+		printError "-${o}: format must be FIELDNAME=VALUE."
+		cleanExit $EX_USAGE
+	fi
+}
+
+checkInputFieldLength ()
+{
+	local field="$1"
+
+	if [ ${#field} -lt 2 -o ${#field} -gt 255 ]; then
+		printError "-${o}: length of field name \"$field\" (${#field}) is outside valid boundaries (2-255)"
+		cleanExit $EX_USAGE
+	fi
+}
+
+checkInputFieldUnicity ()
+{
+	local p='' key="$1" lowercaseKey="$2"
+
+	p="x${lowercaseKey}Y"
+	if [ "$newTagString" != "${newTagString//$p/@}" ]; then
+		printError "-${o}: all tags must be unique (field name \"${key}\" already specified)."
+		cleanExit $EX_USAGE
+	fi
+	newTagString="${newTagString}${p}"
+}
+
+checkInputValueLength ()
+{
+	local field="$1" value="$2"
+
+	if [ ${#value} -lt 1 ]; then
+		printError "-${o}: value of field \"${field}\" must not be empty."
+		cleanExit $EX_USAGE
+	fi
+}
+
+doListAction ()
+{
+	local ec=$EX_OK
+
+	if hasApetag ; then
+		getApetagSize &&
+		getApetagOffset &&
+		getItemsOffset &&
+		getNumberOfItems &&
+		getItems &&
+		listItems ; ec=$?
+	else
+		printWarning "file \"${file}\" does not contain an APEv2 tag."
+	fi
+	return $ec
+}
+
+doDumpAction ()
+{
+	local ec=$EX_OK
+
+	if hasApetag ; then
+		getApetagSize &&
+		getApetagOffset &&
+		getItemsOffset &&
+		getNumberOfItems &&
+		getItems &&
+		dumpItems ; ec=$?
+	else
+		printWarning "file \"${file}\" does not contain an APEv2 tag."
+		ec=$EX_KO
+	fi
+	return $ec
+}
+
+doCopyAction ()
+{
+	local ec=$EX_OK
+
+	if hasApetag ; then
+		getApetagSize &&
+		getApetagOffset &&
+		removeApetag; ec=$?
+	fi
+
+	if [ $ec -eq $EX_OK ]; then
+		if [ "$copyApetagLocation" = 'bottom' ]; then
+			cat "${tempDir}/common/apecopy" >> "$file" 2>/dev/null || ec=$EX_KO
+		elif [ "$copyApetagLocation" = 'top' ]; then
+			tempFile="${tempProcessDir}/tempfile"
+			cp "${tempDir}/common/apecopy" "$tempFile" >/dev/null 2>&1 &&
+			cat "$file" >> "$tempFile" >/dev/null 2>&1 &&
+			rm -f "$file" >/dev/null 2>&1 &&
+			mv -f "$tempFile" "$file" >/dev/null 2>&1 || ec=$EX_KO
+		else
+			ec=$EX_SOFTWARE
+		fi
+	else
+		ec=$EX_SOFTWARE
+	fi
+
+	if [ $ec -eq $EX_SOFTWARE ]; then
+		printError "internal software error."
+	fi
+	return $ec
+}
+
+doWriteAction ()
+{
+	local ec=$EX_OK artworkFilename
+
+	if [ $removeAllTags = true ]; then
+		if hasApetag ; then
+			getApetagSize &&
+			getApetagOffset &&
+			removeApetag; ec=$?
+			if [ $newTagsCount = 0 ]; then
+				return $ec
+			fi
+		elif [ $newTagsCount = 0 ]; then
+			return $ec
+		fi
+
+		itemsCount=0 allKeys=''
+		unset itemKeys itemLowercaseKeys itemValues
+		declare -a itemKeys=()
+		declare -a itemLowercaseKeys=()
+		declare -a itemValues=()
+	fi
+
+	if [ $ec -eq $EX_OK ]; then
+		if hasApetag ; then
+			getApetagSize &&
+			getApetagOffset &&
+			getItemsOffset &&
+			getNumberOfItems &&
+			getItems &&
+			removeItems &&
+			removeApetag ; ec=$?
+		fi
+
+		if [ $ec -eq $EX_OK ]; then
+			addNewItems; ec=$?
+			if [ $itemsCount -gt 0 ]; then
+				writeNewApetag &&
+				listItems; ec=$?
+			fi
+		fi
+	fi
+
+	return $ec
+}
+
+doAction ()
+{
+	local ec=$EX_OK
+
+	initFileVars
+	case "$action" in
+		list) doListAction ; ec=$? ;;
+		dump) doDumpAction ; ec=$? ;;
+		copy) doCopyAction ; ec=$? ;;
+		write) doWriteAction ; ec=$? ;;
+	esac
+	return $ec
+}
+
+waitForJobs ()
+{
+	local jn ec=$EX_OK jec
+
+	for jn in $( jobs -p ); do
+		wait $jn ; jec=$?
+		if [ $jec -ne $EX_OK ]; then
+			ec=$jec
+		fi
+	done
+	return $ec
+}
+
+# main() ======================================================================
+
+me='APEv2'
+calledAs="${0##*/}"
+VERSION='1.0.2'
+
+EX_OK=0             # successful termination
+EX_KO=1             # unsuccessful termination
+EX_USAGE=64         # command line usage error
+EX_DATAERR=65       # data format error
+EX_NOINPUT=66       # cannot open input
+EX_NOUSER=67        # addressee unknown
+EX_NOHOST=68        # host name unknown
+EX_UNAVAILABLE=69   # service unavailable
+EX_SOFTWARE=70      # internal software error
+EX_OSERR=71         # system error (e.g., can't fork)
+EX_OSFILE=72        # critical OS file missing
+EX_CANTCREAT=73     # can't create (user) output file
+EX_IOERR=74         # input/output error
+EX_TEMPFAIL=75      # temp failure; user is invited to retry
+EX_PROTOCOL=76      # remote error in protocol
+EX_NOPERM=77        # permission denied
+EX_CONFIG=78        # configuration error
+EX_INTERRUPT=143    # user interruption (Ctrl+C)
+
+if [ -n "$LC_ALL" ]; then
+	unset LC_ALL
+fi
+export LANG='en_US.UTF-8'
+export LC_NUMERIC='C'
+
+sedcmd='gsed' datecmd='date' gnudate=false
+if which 'uname' >/dev/null 2>&1 ; then
+	OS="$( uname -s )"
+	if [ "$OS" = 'Linux' ]; then
+		sedcmd='sed' datecmd='date' gnudate=true
+	else
+		if which 'gdate' >/dev/null 2>&1; then
+			datecmd='gdate' gnudate=true
+		else
+			datecmd='date' gnudate=false
+		fi
+	fi
+fi
+
+checkBinaries
+
+for signal in INT TERM ABRT PIPE; do
+	trap "cleanAbort" $signal
+done
+
+action='' outputMode='colors' removeAllTags=false newTagString='' debug=false newReadOnlyKeys=''
+newTagsCount=0 deletedKeysCount=0 dumpKeysCount=0 copyFromFile=''
+declare -a newKeys=()
+declare -a newLowercaseKeys=()
+declare -a newValues=()
+declare -a newValues=()
+declare -a deletedKeys=()
+declare -a deletedLowercaseKeys=()
+declare -a dumpKeys=()
+declare -a dumpFiles=()
+
+setColors # initiate default coloring
+
+# C, z and Z must be parsed first in order to disable coloring before everything else
+while getopts 'CzZDhVit:r:Ra:b:d:f:' o ; do
+	case $o in
+		C) outputMode='human'; setColors ;;
+		D) debug=true ;;
+		z) outputMode='machine'; setColors ;;
+		Z) outputMode='raw'; setColors ;;
+		R) removeAllTags=true; if [ -z "$action" ]; then action='write'; fi ;;
+
+		f)
+			copyFromFile="$OPTARG"
+			if [ ! -e "$copyFromFile" ]; then
+				printError "-${o}: no such file (\"${copyFromFile}\")."
+				cleanExit $EX_NOINPUT
+			elif [ ! -f "$copyFromFile" ]; then
+				printError "-${o}: \"${copyFromFile}\" is not a regular file."
+				cleanExit $EX_NOINPUT
+			elif [ ! -r "$copyFromFile" ]; then
+				printError "-${o}: file \"${copyFromFile}\" is not readable (permission denied)."
+				cleanExit $EX_NOPERM
+			fi
+			if [ -z "$action" ]; then action='copy'; fi
+			;;
+
+		i)
+			if [ -z "$action" ]; then action='write'; fi
+
+			while read -r line; do
+				checkInputFieldValueFormat "$line"
+				newKey="${line%%=*}"
+				checkInputFieldLength "$newKey"
+				newLowercaseKey="$( echo -En "$newKey" | tr '[:upper:]' '[:lower:]' )"
+				if [ "${newKey:0:3}" = 'ro:' ]; then
+					newKey="${newKey:3}"
+					newLowercaseKey="${newLowercaseKey:3}"
+					newReadOnlyKeys="x${newLowercaseKey}Y"
+				fi
+				checkInputFieldUnicity "$newKey" "$newLowercaseKey"
+
+				newValue="${line#*=}"
+				checkInputValueLength "$newKey" "$newValue"
+
+				newKeys[$newTagsCount]="$newKey"
+				newLowercaseKeys[$newTagsCount]="$newLowercaseKey"
+				if [ "${newValue:0:5}" = 'data:' ]; then
+					if [ "${newLowercaseKey:0:9}" = 'cover art' ]; then
+						printError "-${o}: bad syntax for cover art item (use \"artwork:filename\x00:base64\")."
+						cleanExit $EX_USAGE
+					fi
+					createTempDir
+					if [ "$OS" = 'Linux' ]; then
+						echo -En "${newValue:5}" | base64 -d > "${tempDir}/common/newBinary.${newTagsCount}" 2>/dev/null
+					else
+						echo -En "${newValue:5}" | base64 -D -o "${tempDir}/common/newBinary.${newTagsCount}" >/dev/null 2>&1
+					fi
+					newValues[$newTagsCount]="binaryfilepath:${tempDir}/common/newBinary.${newTagsCount}"
+				elif [ "${newValue:0:8}" = 'artwork:' ]; then
+					if [ "${newLowercaseKey:0:9}" != 'cover art' ]; then
+						printError "-${o}: cover art field name must begin with \"Cover Art\"."
+						cleanExit $EX_USAGE
+					fi
+					createTempDir
+					artworkFilename="${newValue:8}"; artworkFilename="${artworkFilename%:*}"
+					artworkFilename="$( echo -en "${newValue:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 1 2>/dev/null )"
+					if [ "$OS" = 'Linux' ]; then
+						echo -en "${newValue:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 2 2>/dev/null | base64 -d > "${tempDir}/common/newArtwork.${newTagsCount}" 2>/dev/null
+					else
+						echo -en "${newValue:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 2 2>/dev/null | base64 -D -o "${tempDir}/common/newArtwork.${newTagsCount}" 2>/dev/null
+					fi
+					newValues[$newTagsCount]="artworkfilepath:${artworkFilename}:${tempDir}/common/newArtwork.${newTagsCount}"
+				else
+					newValues[$newTagsCount]="$( echo -En "$newValue" | $sedcmd -e 's@\\x00@\x01@g' -e 's@\\n@\n@g' )"
+				fi
+				((newTagsCount++))
+			done <&0
+			;;
+
+		a|b)
+			if [ -z "$action" ]; then action='write'; fi
+
+			checkInputFieldValueFormat "$OPTARG"
+
+			newKey="${OPTARG%%=*}"
+			checkInputFieldLength "$newKey"
+			newLowercaseKey="$( echo -En "$newKey" | tr '[:upper:]' '[:lower:]' )"
+			if [ "${newKey:0:3}" = 'ro:' ]; then
+				newKey="${newKey:3}"
+				newLowercaseKey="${newLowercaseKey:3}"
+				newReadOnlyKeys="x${newLowercaseKey}Y"
+			fi
+			checkInputFieldUnicity "$newKey" "$newLowercaseKey"
+
+			if [ "$o" = 'a' -a "${newLowercaseKey:0:9}" != 'cover art' ]; then
+				printError "-${o}: item field name must begin with \"Cover Art\"."
+				cleanExit $EX_USAGE
+			elif [ "$o" = 'b' -a "${newLowercaseKey:0:9}" = 'cover art' ]; then
+				printError "-${o}: item field name must NOT begin with \"Cover Art\". To attach cover artwork, use -a instead."
+				cleanExit $EX_USAGE
+			fi
+
+			newValue="${OPTARG#*=}"
+			checkInputValueLength "$newKey" "$newValue"
+			if [ ! -e "$newValue" ]; then
+				printError "-${o}: no such file (\"${newValue}\")."
+				cleanExit $EX_NOINPUT
+			elif [ ! -f "$newValue" ]; then
+				printError "-${o}: \"${newValue}\" is not a regular file."
+				cleanExit $EX_NOINPUT
+			elif [ ! -r "$newValue" ]; then
+				printError "-${o}: file \"${newValue}\" is not readable (permission denied)."
+				cleanExit $EX_NOPERM
+			fi
+
+			if [ "$o" = 'a' ]; then
+				case "$newValue" in
+					*.jpeg|*.jpg|*.JPEG|*.JPG) artworkFileExtension='jpg' ;;
+					*.png|*.PNG) artworkFileExtension='png' ;;
+					*.gif|*.GIF) artworkFileExtension='gif' ;;
+					*) printError "-${o}: image file extension must be .jpg, .jpeg, .png or .gif." ; cleanExit $EX_DATAERR ;;
+				esac
+			fi
+
+			newKeys[$newTagsCount]="$newKey"
+			newLowercaseKeys[$newTagsCount]="$newLowercaseKey"
+			if [ "$o" = 'a' ]; then
+				case "$newLowercaseKey" in
+					'cover art (front)') newValueFilename="cover.${artworkFileExtension}" ;;
+					'cover art (back)') newValueFilename="back.${artworkFileExtension}" ;;
+					*) newValueFilename="other.${artworkFileExtension}" ;;
+				esac
+				newValues[$newTagsCount]="artworkfilepath:${newValueFilename}:${newValue}"
+			else
+				newValues[$newTagsCount]="binaryfilepath:${newValue}"
+			fi
+			((newTagsCount++))
+			;;
+
+		d)
+			if [ -z "$action" ]; then action='dump'; fi
+
+			checkInputFieldValueFormat "$OPTARG"
+
+			dumpKey="${OPTARG%%=*}"
+			checkInputFieldLength "$dumpKey"
+			dumpKey="$( echo -En "$dumpKey" | tr '[:upper:]' '[:lower:]' )"
+
+			dumpFile="${OPTARG#*=}"
+			if [ ${#dumpFile} -lt 1 ]; then
+				printError "-${o}: you must provide a valid file path."
+				cleanExit $EX_USAGE
+			fi
+
+			dumpKeys[$dumpKeysCount]="$dumpKey"
+			dumpFiles[$dumpKeysCount]="$dumpFile"
+			((dumpKeysCount++))
+			;;
+
+		t)
+			if [ -z "$action" ]; then action='write'; fi
+
+			checkInputFieldValueFormat "$OPTARG"
+			newKey="${OPTARG%%=*}"
+			checkInputFieldLength "$newKey"
+			newLowercaseKey="$( echo -En "$newKey" | tr '[:upper:]' '[:lower:]' )"
+			if [ "${newKey:0:3}" = 'ro:' ]; then
+				newKey="${newKey:3}"
+				newLowercaseKey="${newLowercaseKey:3}"
+				newReadOnlyKeys="x${newLowercaseKey}Y"
+			fi
+			checkInputFieldUnicity "$newKey" "$newLowercaseKey"
+
+			newValue="${OPTARG#*=}"
+			checkInputValueLength "$newKey" "$newValue"
+
+			newKeys[$newTagsCount]="$newKey"
+			newLowercaseKeys[$newTagsCount]="$newLowercaseKey"
+			newValues[$newTagsCount]="$( echo -En "$newValue" | $sedcmd -e 's@\\x00@\x01@g' -e 's@\\n@\n@g' )"
+			((newTagsCount++))
+			;;
+
+		r)
+			if [ -z "$action" ]; then action='write'; fi
+			checkInputFieldLength "$OPTARG"
+			deletedKeys[$deletedKeysCount]="$OPTARG"
+			deletedLowercaseKeys[$deletedKeysCount]="$( echo -En "$OPTARG" | tr '[:upper:]' '[:lower:]' )"
+			((deletedKeysCount++))
+			;;
+
+		h) printUsage ; cleanExit $EX_OK ;;
+
+		V) echo "$me $VERSION" ; cleanExit $EX_OK ;;
+
+		*) printError "try '$me -h' for more information." ; cleanExit $EX_USAGE ;;
+	esac
+done
+if [ -z "$action" ]; then action='list'; fi
+
+shift $(( OPTIND - 1 ))
+if [ $# -lt 1 ]; then
+	printWarning "no files specified on the command line; try '$me -h' for more information."
+	cleanExit $EX_USAGE
+fi
+
+gotFileErrors=false
+for f in "$@"; do
+	if [ ! -e "$f" ]; then
+		printError "file \"${f}\" doesn't exist."
+		gotFileErrors=true
+	elif [ ! -f "$f" ]; then
+		printError "\"${f}\" is not a regular file."
+		gotFileErrors=true
+	elif [ ! -r "$f" ]; then
+		printError "cannot open \"${f}\" for reading (permission denied)."
+		gotFileErrors=true
+	elif [ "$action" != 'list' -a ! -w "$f" ]; then
+		printError "cannot open \"${f}\" for writing (permission denied)."
+		gotFileErrors=true
+	fi
+done
+if [ $gotFileErrors = true ]; then
+	cleanExit $EX_NOINPUT
+fi
+
+createTempDir
+
+nFiles=$#
+declare -a inputFiles=("$@")
+
+if [ $debug = true ]; then
+	nProcesses=1
+else
+	if which 'nproc' >/dev/null 2>&1; then # GNU Coreutils installed
+		nProcesses="$( nproc 2>/dev/null )"
+	elif which 'gnproc' >/dev/null 2>&1; then # GNU Coreutils installed on OS Ⅹ
+		nProcesses="$( gnproc 2>/dev/null )"
+	elif [ -e '/proc/cpuinfo' ]; then # Linux
+		nProcesses="$( grep -cF 'cpu MHz' /proc/cpuinfo 2>/dev/null )"
+	elif [ "$OS" = 'Darwin' ]; then # OS Ⅹ
+		# Many thanks to Tobias Link for helping me port APEv2 to OS Ⅹ
+		nProcesses="$( system_profiler -detailLevel full SPHardwareDataType 2>/dev/null | grep -F 'Total Number of Cores:' 2>/dev/null | cut -d ':' -f 2 2>/dev/null | tr -d ' ' 2>/dev/null )"
+	else
+		nProcesses=4
+	fi
+	if [ $nFiles -lt $nProcesses ]; then
+		nProcesses=$nFiles
+	fi
+fi
+
+ec=$EX_OK
+if [ "$action" = 'copy' ]; then
+	file="$copyFromFile"
+	initFileVars
+	pn=0
+	createTempProcessDir
+	if hasApetag ; then
+		getApetagSize &&
+		getApetagOffset; ec=$?
+		if [ $ec -eq $EX_OK ]; then
+			if [ "$apetagLocation" = 'bottom' ]; then
+				if [ $hasHeader = true ]; then
+					tail -c $(( 32 + tagSize )) "$copyFromFile" > "${tempDir}/common/apecopy" 2>/dev/null ; ec=$?
+				else
+					tail -c $tagSize "$copyFromFile" > "${tempDir}/common/apecopy" 2>/dev/null ; ec=$?
+				fi
+			elif [ "$apetagLocation" = 'top' ]; then
+				head -c $(( 32 + tagSize )) "$copyFromFile" > "${tempDir}/common/apecopy" 2>/dev/null ; ec=$?
+			else
+				ec=$EX_SOFTWARE
+			fi
+			if [ $ec -ne $EX_OK ]; then
+				printError "internal software error."
+				cleanExit $EX_SOFTWARE
+			fi
+			copyApetagLocation="$apetagLocation"
+
+			getItemsOffset &&
+			getNumberOfItems &&
+			getItems &&
+			listItems; ec=$?
+			if [ $ec -ne $EX_OK ]; then
+				cleanExit $ec
+			fi
+		fi
+	else
+		printWarning "file \"${file}\" does not contain an APEv2 tag."
+		cleanExit $EX_OK
+	fi
+elif [ "$action" = 'write' ]; then
+	for ((i=0; i<newTagsCount; i++)); do
+		if [ "${newValues[$i]:0:5}" = 'data:' ]; then
+			if [ "$OS" = 'Linux' ]; then
+				echo -En "${newValues[$i]:5}" | base64 -d > "${tempDir}/common/newBinary.${i}" 2>/dev/null
+			else
+				echo -En "${newValues[$i]:5}" | base64 -D -o "${tempDir}/common/newBinary.${i}" >/dev/null 2>&1
+			fi
+			newValues[$i]="binaryfilepath:${tempDir}/common/newBinary.${i}"
+		elif [ "${newValues[$i]:0:8}" = 'artwork:' ]; then
+			artworkFilename="${newValues[$i]:8}"; artworkFilename="${artworkFilename%:*}"
+			artworkFilename="$( echo -en "${newValues[$i]:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 1 2>/dev/null )"
+			if [ "$OS" = 'Linux' ]; then
+				echo -en "${newValues[$i]:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 2 2>/dev/null | base64 -d > "${tempDir}/common/newArtwork.${i}" 2>/dev/null
+			else
+				echo -en "${newValues[$i]:8}" | LC_ALL=C tr '\0' '\1' 2>/dev/null | LC_ALL=C cut -d "$( echo -en "\x01" )" -f 2 2>/dev/null | base64 -D -o "${tempDir}/common/newArtwork.${i}" 2>/dev/null
+			fi
+			newValues[$i]="artworkfilepath:${artworkFilename}:${tempDir}/common/newArtwork.${i}"
+		fi
+	done
+fi
+
+ec=$EX_OK
+if [ $nProcesses -eq 1 ]; then
+	pn=0
+	for ((fn=0; fn<nFiles; fn++)); do
+		file="${inputFiles[$fn]}"
+		createTempProcessDir
+		doAction; jec=$?
+		if [ $jec -ne $EX_OK ]; then ec=$jec; fi
+		flushOutputQueue
+	done
+else
+	for ((fn=0, pn=0; fn<nFiles; fn++, pn++)); do
+		createTempProcessDir
+		if [ $pn -lt $nProcesses ]; then
+			file="${inputFiles[$fn]}"
+			doAction &
+		else
+			waitForJobs ; jec=$?
+			if [ $jec -ne $EX_OK ]; then ec=$jec; fi
+			flushOutputQueue
+			pn=0
+			file="${inputFiles[$fn]}"
+			createTempProcessDir
+			doAction &
+		fi
+	done
+
+	waitForJobs ; jec=$?
+	if [ $jec -ne $EX_OK ]; then ec=$jec; fi
+	flushOutputQueue
+fi
+cleanExit $ec

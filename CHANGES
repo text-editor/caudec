@@ -1,0 +1,158 @@
+v1.7.5: WavPack lossy: don't remove Replaygain tags after transcoding
+        APEv2: don't store duplicate value, transform duplicate fields into unique multi-value fields
+        APEv2: fix handling of tags that start with '('
+        Opus: added support for embedded artwork
+v1.7.4: by default, set the number of processes to the number of logical CPU cores if equal to 4 or lower, or to the number of physical CPU cores
+        when applying Replaygain, make additional -G parameter act as a preamp value
+v1.7.3: new -DDD parameter: delete source file upon successful transcoding (USE WITH CARE)
+        new sampling rates and presets: 352800 Hz, 384000 Hz, -r dxd
+        replaygain bugfix: check for multichannel audio instead of strictly mono or stereo
+        bugfix: sanitize track and disc number metadata
+v1.7.2: added support for WavPack 4.70.0
+        updated all URLs to http://caudec.net/
+v1.7.1: added peak normalization with '-G albumpeak' (by album) and '-G trackpeak' (by track)
+        use TAK multithreading when it makes sense
+        replaced apetag optional dependency with APEv2, which supports previously missing features: NULL separated lists, embedded artwork and binary data
+        added support for extracting and importing APEv2 artwork
+        significantly sped up extracting embedded artwork from FLAC files
+        support parsing version number of lossyWAV 1.3.1 and up
+        added support for PERFORMER metadata
+        new 'ID3Padding' configuration parameter: size in bytes of padding to add to ID3v2 tags (default: 512 bytes)
+v1.7.0: new -2 parameter: convert mono and multichannel audio to stereo (upmix / downmix), using proper channel mappings
+        '-r cd' preset now implies '-b 16 -r 44100 -2' (includes automatic conversion to stereo where applicable)
+        new -z parameter: produce machine-parsable output
+        added support for AIFF and CAF (Core Audio File)
+        directories are now accepted as input: caudec will automatically find all eligible files within those directories (use in conjunction with 'ignoreUnsupportedFiles')
+        new 'ignoreUnsupportedFiles' configuration parameter: set to true to prevent caudec from aborting when some of the input files are unsupported (false by default)
+        -t (testing file integrity) can now be used with all lossless codecs, using hash metadata (-H)
+        added SHA256 and SHA512 hashing
+        renamed 'CRC' to 'CRC32'; backward compatibility with files tagged with 'CRC=' is maintained
+        check internal MD5 hash whenever possible, to detect potential codec bugs
+        new 'enableColors' configuration parameter: true by default, set to 'false' to disable coloring of human-readable output
+        new 'brightColors' configuration parameter: true by default, set to 'false' to use darker colors (enableColors needs to be true)
+        -G parameter (apply gain) and -S parameter (compute Soundcheck data) can now take an arbitrary value (signed number from -99.99 to +99.99)
+        significantly sped up computing album gain
+        check the output of replaygain tools more thoroughly
+        caudec -g: process multiline metadata
+        various fixes when computing Replaygain with Ogg Vorbis, MP3 and AAC files
+        new dependencies: SoX (mandatory) and ffmpeg (ALAC, AAC and Monkey's Audio)
+        removed shntool and alac dependencies
+        let SoX output Microsoft-compliant WAV files (fixes some compatibility issues with multichannel files)
+        added support for eyeD3 version 0.6.x and 0.7.x; the former is recommended however, as the latter is broken
+        workaround for broken eyeD3 0.7.1: set front cover artwork in MP3 files, if available
+        better handling of Windows binaries with Wine; search home directory to find Wine user directories automatically
+        don't store empty hash metadata, when hashing fails
+        better detection of the number of CPU cores
+        improved example command line that caudec outputs when fed too many files
+        removed confusing 'm4a' codec name (with -c)
+        fixed lossyTAK regression
+        lossyWV: use --merge-blocks (better compression)
+        better ramdisk space management (various fixes and improvements)
+        new ramdisk space usage monitoring function: print a warning if the estimation was too low
+        better comparison of version numbers when checking for new versions online
+        only strip out ENCODING metadata field when transcoding
+        more compact display of statistics in human-readable output: removed unnecessary values
+        many, many more fixes
+v1.6.4: -o/O/P may now be specified after each -c parameter, in order to set per-codec destination directories (useful when transcoding to several codecs at once)
+        allow simultaneous usage of codecs with the same file extension (e.g. ALAC and AAC; just make sure to specify per-codec destination directories)
+        reduced ramdisk space requirements, especially with lossyWAV
+v1.6.3: new -k parameter: keep existing destination files (don't overwrite them)
+        new -K parameter: keep existing destination files if they're newer than their source
+        fixed OS Ⅹ compatibility (GNU version of sed required: gsed)
+        fixed: -P DIR -c lossyWAV
+        fixed APEv2 to APEv2 tagging regression
+        fixed division by zero bug; use gdate on OS Ⅹ if available
+        removed fgrep and readlink dependencies, consolidated various command lines
+v1.6.2: new -u parameter: check for new versions
+        new 'sendHardwareDetails' configuration parameter (defaults to false): include CPU and RAM information in caudec's User Agent string when checking for new versions
+        added caudec's User Agent string in the output of 'caudec -h' (test with 'sendHardwareDetails' set to true and false)
+        added CBR (constant) and CVBR (constrained) bitrate modes and parameters (-b/-B) for Opus (see important note: http://caudec.net/documentation/versions/#opus)
+        added 'tagCompressionSetting' configuration parameter: store compression setting in metadata (defaults to false)
+v1.6.1: updated all files with new URL: http://caudec.outpost.fr/
+v1.6.0: new feature: tag whitelisting and blacklisting (tagWhitelist='' and tagBlacklist='' in caudecrc)
+        added -P DIR parameter: set and create output directory, and mirror the source file's path components (e.g. 'a/b/file.flac' => 'DIR/a/b/file.ogg')
+        added CBR (constant) and ABR (average) bitrate modes and parameters (-b/-B) for LAME, Ogg Vorbis, Nero AAC, qaac
+        -H parameter can now be used as a standalone action, without transcoding (computes and tags specified hashes)
+        added -q iTunes preset for -c qaac (constrained VBR, ~256 kbps)
+        added -r sacd/dvda/bluray/pono resampling presets; -r now accepts values in kHz as well
+        added 'maxInputFiles' configuration parameter: raise a warning and abort when the number of input files is greater than that value
+        added 'setCompilationFlagWithAlbumArtist' configuration parameter, for setting the iTunes Compilation flag when ALBUMARTIST is used
+        added 'keepWavMetadata' configuration parameter, for keeping WAV metadata with FLAC and WavPack (defaults to false)
+        added 'hashes' configuration parameter: listed hashes will systematically be computed and tagged (e.g. for traceability)
+        sanitize caudecrc input
+        updated eyeD3 parameters (version 0.7 breaks compatibility with version 0.6)
+        bugfix: all compression presets allowed with -q are now allowed in caudecrc
+        bugfix: don't mix up tags when encoding to both lossless and lossy codecs
+        bugfix: do tag hash metadata when requested, even when the rest of the metadata is ignored (-C)
+        bugfix: compute and tag appropriate hash metadata for lossyFLAC, lossyWV and lossyTAK
+        various fixes
+v1.5.3: added support for QAAC (TVBR and CBR modes)
+        removed support for winaac (neroAacEnc.exe with Wine), QAAC is better
+        bugfix: preserve lossless tags accordingly when encoding to both lossless and lossy codecs
+        added option to apply gain after decoding and before encoding
+        moved 'preloadSources' configuration parameter to caudecrc
+        added 'preventClipping' configuration parameter, used when resampling or applying gain, defaults to true
+        clean up after other instances that terminated uncleanly
+        clean up upon SIGTERM, SIGABRT, SIGPIPE in addition to SIGINT
+v1.5.2: removed deprecated opus encoding profiles (music and speech)
+        added CBR encoding with LAME (e.g. caudec -c mp3 -b 192)
+        added SoundCheck support (MP3, AAC and ALAC)
+v1.5.1: fixed file caching locking mechanism
+        report actual read speed
+v1.5.0: Replaygain scanner (except for Opus and Musepack)
+        copy embedded artwork from FLAC and ALAC, to FLAC, ALAC, AAC and MP3
+        new -C switch disables metadata preservation
+        report both read and write speeds
+        better estimation of ramdisk space requirements with APE input files
+        various fixes
+v1.4.3: support for ALAC encoding with ffmpeg
+        try $TMPDIR and /tmp when ramdisk is too small
+        output error messages from external tools when CAUDECDEBUG=true
+        bugfix: use .wvc correction files when decoding WavPack Hybrid
+        bugfix for ALAC files with multi-line comments
+        more precise estimation of WavPack ramdisk space requirements
+v1.4.2: support for Opus (with both music and speech profiles)
+        bugfix for non-english locales that don't use '.' as a decimal separator
+        new -O switch: automatically create output directory
+        copy non-standard metadata fields over to MP3 in TXXX frames
+        maxInstances from /etc/caudecrc takes precedence over ~/.caudecrc
+        precise evaluation of ramdisk space requirements with TAK input files
+v1.4.1: fixed bug that made other instances stall when aborting one instance
+        install.sh: autodetect path of current caudec installation
+v1.4.0: now runs on OS Ⅹ (tested on OS Ⅹ Lion)
+        smart handling of concurrent instances
+        better detection of ramdisks
+        don't abort if no ramdisk is available
+        support for e/m TAK compression parameters
+        removed reckless option to disable checking of available space
+        fixed long standing bugs in the installation script
+        fixed regression with empty APEv2 tags
+        better handling of ALAC metadata
+        changed handling of user interruption (Ctrl+C), removed pgrep dependency
+        lots of minor fixes
+v1.3.7: support for WavPack Lossy bitrates in bits per sample
+        support for TOTALTRACKS and TOTALDISCS vorbis comment fields
+        bugfix for multi-line tags
+        temporary workaround for NULL separated lists in APEv2 tags
+v1.3.6: bugfix for files with the '%' char in their filename and/or tags
+v1.3.5: add support for conductor, subtitle, license, iTunes compilation,
+        disc fields
+        don't copy replaygain and hash fields to lossy codecs
+        don't downmix to stereo when resampling
+v1.3.4: add support for Album Artist
+        save tags with -c winaac
+v1.3.3: add discnumber field (TPOS) in MP3 files
+        only output debugging information in verbose mode
+v1.3.2: allow decoding and encoding at the same time
+v1.3.1: corrected lossyWAV decoding bug
+        set lossyTAK compression setting
+v1.3.0: added support for resampling
+        corrected bug that increased tmpfs usage
+        improved calculation of required space on tmpfs
+        added CAUDECDIR environment variable
+v1.2.0: added support for WavPack Lossy
+v1.1.2: added checking for required binaries
+        silenced external tool outputs
+v1.1.1: removed unnecessary code
+v1.1.0: added support for Musepack encoding
+v1.0.0: initial release
